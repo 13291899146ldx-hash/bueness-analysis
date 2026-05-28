@@ -1,0 +1,175 @@
+import os
+import time
+import requests
+from typing import Dict, Any, Optional, Tuple
+
+class SalesQAWorkflow:
+    def __init__(self, api_key: str, output_dir: str = r"D:\audieo"):
+        self.api_key = api_key
+        self.base_url = "https://dashscope.aliyuncs.com/api/v1"
+        self.output_dir = output_dir
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+
+    def submit_asr_task(self, local_file_path: str) -> Tuple[bool, str, str]:
+        """
+        """
+        if not os.path.exists(local_file_path):
+            return False, "", f"文件路径不存在: {local_file_path}"
+            
+        try:
+            policy_url = f"{self.base_url}/uploads"
+            params = {"action": "getPolicy", "model": "fun-asr"}
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            policy_resp = requests.get(policy_url, headers=headers, params=params)
+            if policy_resp.status_code != 200:
+                return False, "", f"获取上传凭证失败: {policy_resp.text}"
+            policy = policy_resp.json().get('data')
+            file_name = os.path.basename(local_file_path)
+            key = f"{policy['upload_dir']}/{file_name}"
+            with open(local_file_path, 'rb') as f:
+                # 关键修复：加入 policy 中要求的 x-oss-object-acl 和 x-oss-forbid-overwrite
+                files = {
+                    'key': (None, key),
+                    'OSSAccessKeyId': (None, policy['oss_access_key_id']),
+                    'policy': (None, policy['policy']),
+                    'Signature': (None, policy['signature']),
+                    'x-oss-object-acl': (None, 'private'),  
+                    'x-oss-forbid-overwrite': (None, 'true'), 
+                    'success_action_status': (None, '200'),
+                    'file': (file_name, f)
+                }
+                upload_resp = requests.post(policy['upload_host'], files=files)
+            
+            if upload_resp.status_code != 200:
+                return False, "", f"文件上传OSS失败: {upload_resp.text}"
+            submit_url = f"{self.base_url}/services/audio/asr/transcription"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "X-DashScope-Async": "enable",
+                "X-DashScope-OssResourceResolve": "enable"
+            }
+            payload = {
+                "model": "fun-asr",
+                "input": {"file_urls": [f"oss://{key}"]},
+                "parameters": {"diarization_enabled": True}
+            }
+            
+            res = requests.post(submit_url, headers=headers, json=payload)
+            json_resp = res.json()
+            if 'output' in json_resp and 'task_id' in json_resp['output']:
+                return True, json_resp['output']['task_id'], "提交成功"
+            else:
+                return False, "", f"服务器响应异常: {json_resp}"      
+        except Exception as e:
+            return False, "", f"流程执行异常: {str(e)}"
+    def query_asr_result(self, task_id: str) -> Dict[str, Any]:
+        query_url = f"{self.base_url}/tasks/{task_id}"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        response = requests.get(query_url, headers=headers)
+        output_data = response.json().get('output', {})
+        task_status = output_data.get('task_status', '')
+
+        if task_status == "SUCCEEDED":
+            results = output_data.get('results', [])
+            if not results:
+                return {"task_status": "WAITING", "pure_chat_text": ""}
+            
+            download_url = results[0].get('transcription_url')
+            
+            if not download_url:
+                return {"task_status": "WAITING", "pure_chat_text": ""}
+            file_resp = requests.get(download_url, headers=headers)
+            if file_resp.status_code != 200:
+                print(f"DEBUG: 下载识别结果失败: {file_resp.text}")
+                return {"task_status": "FAILED", "pure_chat_text": ""}
+      
+            lines = []
+            for transcript in file_resp.json().get('transcripts', []):
+                for sentence in transcript.get('sentences', []):
+                    lines.append(f"说话人{sentence.get('speaker_id', '0')}: {sentence.get('text', '')}")
+            
+            return {"task_status": "SUCCEEDED", "pure_chat_text": "\n".join(lines)}
+            
+        return {"task_status": task_status, "pure_chat_text": ""}
+
+    def poll_asr_until_complete(self, task_id: str) -> Optional[str]:
+        for _ in range(60):
+            res = self.query_asr_result(task_id)
+            if res["task_status"] == "SUCCEEDED": return res["pure_chat_text"]
+            if res["task_status"] == "FAILED": return None
+            time.sleep(5)
+        return None
+
+    def qa_analysis(self, chat_text: str) -> str:
+        system_prompt = """#大模型角色定位：
+你是一位拥有10年经验、精通信贷展业现场审计、擅长多方复杂对话逻辑闭环重组的顶级AI销售质检专家。你的输出结果将直接用于自动化载入飞书文档，必须严格执行格式铁律。
+#核心工作流：对话闭环与场景还原
+在进行任何打分前，你必须通读全局文本，死死咬住上下文逻辑，对碎片化的【说话人0/1/2...】标签执行以下“对话闭环重组”：
+#锁定展业场次与时空切分（含空白期与破冰识别）：
+由于这是线下展业录音，不同客户之间往往存在大段空白、环境杂音或无业务交流的死寂时间（销售正在线下寻找新客户）。
+你必须敏锐捕获这种“空白期”。当空白期结束后，一旦发现某个说话人标签再次出现标准的【销售开场破冰/问候话术】（例如：“您好，打扰一下...”、“老板，咱们聊聊...”、“请问您这边是做餐饮的吗...”、“我是XX金融的...”），代表上一个场次已经终结，判定为进入一段全新的独立展业沟通场次。
+#场次内部的“对话闭环”与主配角剥离：
+在任何一段独立的展业沟通场次内（即从销售破冰开始，到进入下一段破冰或录音结束前），你必须通过语义逻辑研判出：谁是【销售】、谁是【主要客户】、谁是【周边插话人/旁人】。
+闭环铁律：在此段展业沟通期间，即便周边旁人（如客户的配偶、合伙人或在场朋友）突然插话、询问问题或发表意见，你必须将这些插话内容强行“闭环”包裹在当前这一段沟通逻辑里，绝对不能因为有新标签出现就把对话强行切断。
+在打分时，旁人的插话【不能】直接代表主要客户的个人意向或情绪，但主要客户对旁人插话的反应，以及销售对旁人插话的应对（例如：有无耐心解答、中间有无打断、是否合规引导），必须作为当前这一段展业沟通的打分铁证，闭环在同一个分析单元里。
+#14个核心评估特征与审查细则
+[维度一：客户成交意向度维度（以当前段落中“主要客户”的表现为主，闭环内的旁人插话作背景参考）]
+客户基本面及资质锚定：评估主客户的行业背景、具体身份、经济实力/流水、借贷经历、芝麻分、有无借贷决定权及紧急借贷需求。
+客户参与度：计算该段主客户输出时长占比、回应积极度、有无主动分享信息及提问次数（剔除旁人无效插话干扰）。
+客户情绪：观察主客户语音语调是否积极，是否出现明显的反感词汇及抗拒状态表示。
+客户对产品的关注度：审查主客户是否关注产品时效/成本/利息计算/手续费、有无竞品对比、是否重复询问操作方法或优惠。
+客户长期跟进意愿：审查主客户是否留下联系方式、有无下次沟通约定、对出示资料的态度。
+客户异议情况：记录主客户是否存在业务异议、是否连续循环提出异议、解答后情绪是否有明显变好。
+客户产生非业务沟通：观察主客户是否产生地域认同、分享个人经历、情绪宣泄或对销售产生认可关心。
+[维度二：销售展业维度（核心考核：销售对主客户及闭环内旁人插话的综合应对表现）]
+销售固定流程执行：检查销售是否亮明身份/姓名/工号/来意、是否尝试建立信任并吸引客户兴趣。
+销售展业状态：评估销售语音语调是否积极、展业过程中说话的流畅度、是否存在抱怨及消极状态。
+销售展业产品：检查销售是否清晰介绍产品信息（名称/逻辑/优势）、是否主动挖掘需求、专业词汇是否通俗易懂。
+销售展业合规：严厉审查销售展业中是否产生任何“合规严禁词汇”，或使用了不合规的促销技巧。
+销售应对客户异议：检查销售是否认真听取异议（重点审查销售在面对主客户或【旁人插话】质疑时，中间是否有打断情况）、解决态度是积极还是回避、是否达成共识。
+销售与客户情感链接：评估销售是否有同理心（对主客/旁人的抱怨 and 疑问是否进行了安慰和积极回复）、是否适当赞美。
+销售展业结果：审查销售在这次沟通中是否直接进行锁单、是否添加企微、有无驳斥客户或产生不愉快。
+# 输出格式铁律（CSV 格式）
+1. 表头固定：输出的第一行必须为：沟通ID,特征,分数,评分原因
+2. 格式要求：每一行代表一个特征的评估结果，严禁使用 Markdown 代码块（如 ```csv），严禁添加任何前言、总结、后缀或解释性文字。
+3. 内容清洗：
+   - “评分原因”字段中，严禁使用任何英文标点（如逗号、双引号、单引号、斜杠），必须全部替换为中文标点。
+   - “评分原因”字段中，严禁包含任何换行符，确保每一行数据都是完整的单行文本。
+4. 分数规则：必须是 0 到 10 的纯数字整数。
+场次分隔规则：每一个独立的展业沟通场次必须输出完整的14行评估内容。若整篇录音有N个独立场次，则总输出按场次ID顺延排列。
+# 输出范例
+沟通ID,特征,分数,评分原因
+场次1,客户基本面及资质锚定,8,对话闭环结论：本段标签说话人0为销售说话人1为主要客户无旁人。具体分析：客户明确提到从事餐饮行业且流水稳定时间戳15秒处。
+场次1,客户参与度,9,对话闭环结论：本段标签说话人0为销售说话人1为主要客户无旁人。具体分析：客户回应积极并主动询问额度时间戳45秒处。）
+“分数”字段规则：必须是0到10之间的纯数字整数。若该段沟通未涉及某项，分数给0分。
+# 评分原因字段固定格式（防解析崩溃规则）
+该字段必须包含以下内容，并确保整体为单行：
+“对话闭环结论：本段标签[说话人X]为销售，[说话人Y]为主要客户，[说话人Z]为旁人。具体分析：[此处填写详细分析，必须引用时间戳作为打分铁证，且禁止包含英文标点和换行]”
+
+必须精准摘录该段内相关的【原话或具体时间戳（如 15点4秒）】作为打分铁证。
+"""
+        url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        payload = {
+            "model": "qwen3.6-plus",
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": f"以下是转写文本：\n{chat_text}"}]
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        resp = requests.post(url, headers=headers, json=payload)
+        return resp.json()["choices"][0]["message"]["content"] if resp.status_code == 200 else ""
+
+    def run(self, local_file_path: str, filename: str):
+        print(f"开始处理: {local_file_path}")
+        success, task_id, msg = self.submit_asr_task(local_file_path)
+        if not success: return print(msg)
+        chat_text = self.poll_asr_until_complete(task_id)
+        if not chat_text: return print("转写失败")
+        qa_report = self.qa_analysis(chat_text)
+        with open(os.path.join(self.output_dir, filename), "w", encoding="utf-8-sig") as f:
+            f.write(qa_report.strip())
+        print(f" 完成: {os.path.join(self.output_dir, filename)}")
+
+if __name__ == "__main__":
+    workflow = SalesQAWorkflow(api_key="sk-cc583ed891f6489eb4d4f7d7b2a380db")
+    workflow.run(local_file_path=r"D:\audieo\test.wav", filename="质检报告.csv")
