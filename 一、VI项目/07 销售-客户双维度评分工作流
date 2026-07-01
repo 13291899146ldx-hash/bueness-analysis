@@ -1,0 +1,1363 @@
+"""
+面向百文件及千文件批量压测的销售录音质检工作流 V6版本
+
+核心能力：
+1. 直接使用 qwen3.5-omni-plus 对音频做全模态理解，无需单独 ASR 阶段
+2. 保留 V5 的批量并发、manifest 断点续跑、失败重试、结果落盘能力
+3. 强化提示词，让 omni 显式利用语气、停顿、重音、打断、犹豫等声学信号
+4. 同步输出宽表与长表，便于与 V5 结果直接对比
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+
+
+DEFAULT_API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-cc583ed891f6489eb4d4f7d7b2a380db")
+DEFAULT_WORKSPACE = Path(r"D:\audieo")
+DEFAULT_INPUT_DIR = DEFAULT_WORKSPACE / "audio_data"
+SUPPORTED_PATTERNS = ["*.wav", "*.mp3", "*.m4a", "*.aac", "*.amr", "*.flac"]
+RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+CUSTOMER_FEATURES = [
+    "客户基本面及资质锚定",
+    "客户参与度",
+    "客户情绪状态",
+    "客户对产品的关注程度",
+    "客户异议提出及解决情况",
+    "客户产生非业务沟通",
+]
+
+SALES_FEATURES = [
+    "销售的固定流程执行",
+    "销售展业状态",
+    "销售展业产品能力",
+    "销售需求挖掘能力",
+    "销售应对客户异议",
+    "销售与客户的情感链接",
+    "销售的展业结果",
+]
+
+FEATURE_ORDER = CUSTOMER_FEATURES + SALES_FEATURES
+CUSTOMER_DIMENSION = "客户成交意向度"
+SALES_DIMENSION = "销售展业能力维度"
+DIMENSION_BY_FEATURE = {
+    **{feature: CUSTOMER_DIMENSION for feature in CUSTOMER_FEATURES},
+    **{feature: SALES_DIMENSION for feature in SALES_FEATURES},
+}
+FEATURE_WEIGHT_MAP = {
+    "客户基本面及资质锚定": "25%",
+    "客户参与度": "15%",
+    "客户情绪状态": "10%",
+    "客户对产品的关注程度": "25%",
+    "客户异议提出及解决情况": "15%",
+    "客户产生非业务沟通": "10%",
+    "销售的固定流程执行": "20%",
+    "销售展业状态": "10%",
+    "销售展业产品能力": "20%",
+    "销售需求挖掘能力": "20%",
+    "销售应对客户异议": "10%",
+    "销售与客户的情感链接": "10%",
+    "销售的展业结果": "10%",
+}
+
+CUSTOMER_TYPE_NAMES = [
+    "佛系型",
+    "迷茫型",
+    "开放型",
+    "保守型",
+    "选择型",
+    "预判型",
+    "防守型",
+    "筛选型",
+    "成熟型",
+]
+
+ASCII_PUNCT_TRANSLATION = str.maketrans(
+    {
+        ",": "，",
+        ".": "。",
+        ":": "：",
+        ";": "；",
+        "?": "？",
+        "!": "！",
+        "\"": "”",
+        "'": "’",
+        "/": "／",
+        "\\": "／",
+        "(": "（",
+        ")": "）",
+        "[": "【",
+        "]": "】",
+        "{": "｛",
+        "}": "｝",
+        "<": "《",
+        ">": "》",
+        "-": "－",
+    }
+)
+
+
+def normalize_text_key(text: str) -> str:
+    cleaned = re.sub(r"\s+", "", text or "")
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", "", cleaned)
+    return cleaned
+
+
+FEATURE_ALIASES = {
+    "客户情绪状态": "客户情绪",
+    "客户情感": "客户情绪",
+    "客户对产品的关注程度": "客户对产品的关注度",
+    "客户对产品关注度": "客户对产品的关注度",
+    "客户关注度": "客户对产品的关注度",
+    "销售固定流程": "销售固定流程执行",
+    "销售固定流程执行情况": "销售固定流程执行",
+    "销售展业状态表现": "销售展业状态",
+    "销售产品介绍": "销售展业产品",
+    "销售展业产品介绍": "销售展业产品",
+    "销售合规": "销售展业合规",
+    "销售展业合规情况": "销售展业合规",
+    "销售应对异议": "销售应对客户异议",
+    "销售应对客户异议能力": "销售应对客户异议",
+    "销售与客户情感连接": "销售与客户情感链接",
+    "销售与客户情感联结": "销售与客户情感链接",
+    "销售结果": "销售展业结果",
+    "销售展业成果": "销售展业结果",
+    "客户情绪": "客户情绪状态",
+    "客户对产品的关注度": "客户对产品的关注程度",
+    "客户长期跟进意愿": "客户异议提出及解决情况",
+    "客户异议情况": "客户异议提出及解决情况",
+    "销售固定流程执行": "销售的固定流程执行",
+    "销售展业产品": "销售展业产品能力",
+    "销售展业合规": "销售的固定流程执行",
+    "销售与客户情感链接": "销售与客户的情感链接",
+    "销售展业结果": "销售的展业结果",
+}
+
+FEATURE_NAME_MAP: Dict[str, str] = {}
+for canonical_feature in FEATURE_ORDER:
+    FEATURE_NAME_MAP[normalize_text_key(canonical_feature)] = canonical_feature
+for alias, canonical_feature in FEATURE_ALIASES.items():
+    FEATURE_NAME_MAP[normalize_text_key(alias)] = canonical_feature
+
+META_FEATURES = {
+    "客户类型": "客户类型",
+    "客户类型判断原因": "客户类型判断原因",
+    "该场景类型下优秀话术片段": "该场景类型下优秀话术片段",
+}
+
+
+BASE_SYSTEM_PROMPT = """# 角色定位
+你是一位有十年以上线下销售录音质检经验的高级质检专家。你的任务不是单纯做文本理解，而是要直接听音频，联合使用话语内容与可听见的声学线索，输出稳定、可落盘、可批量对比的结构化质检结果。
+
+# V6 的全模态分析要求
+你本次分析必须显式发挥 qwen3.5-omni-plus 的音频理解优势。除了语义内容，还必须优先捕捉以下可直接听到的声学信息，并把这些线索用于评分：
+1. 语速快慢、是否突然变快或变慢
+2. 停顿长度、犹豫、重复、吞吐、卡壳
+3. 音量变化、重音、强调、尾音上扬或下沉
+4. 插话、打断、抢话、重叠说话
+5. 明显可听见的情绪信号，如笑、叹气、烦躁、谨慎、防备、放松、急切
+6. 背景噪声、环境干扰、沉默空档对沟通节奏的影响
+
+如果某个判断来自声学线索，请在评分原因中明确写出，例如“从语速放缓与长停顿可听出客户犹豫”或“从语气上扬与追问频率可听出客户关注度较高”。如果音频中听不清或无法可靠判断，就只能谨慎表述，严禁臆造不存在的声学证据。
+
+# 场次切分要求
+同一条录音中可能包含多个独立沟通场次。你必须根据长停顿、环境切换、销售重新破冰开场等信号做场次切分。
+输出时沟通ID必须统一命名为：场次1、场次2、场次3……，按音频中出现顺序编号。
+
+# 客户类型判断要求
+你必须基于知识库中的九宫格客情锚定体系，为每个场次判断一个主导客户类型。客户类型只能从以下九类中选择一个主类型：
+佛系型、迷茫型、开放型、保守型、选择型、预判型、防守型、筛选型、成熟型
+
+客户类型判断原因必须说明：
+1. 为什么是这个主导类型
+2. 证据必须尽量来自录音原文中的客户表达、客户行为、客户提问、客户回应、语气变化或声学线索
+3. 如果客户同时带有其他类型特征，也可以简短说明，但仍必须给出唯一主导类型
+4. “客户类型”这一行的评分原因字段里只能写九个类型名中的一个，禁止把判断原因、长句解释、证据描述写进“客户类型”这一行
+5. “客户类型判断原因”这一行必须单独输出，不能留空，必须引用至少2条来自录音的证据，优先引用带时间戳的原文证据
+
+# 优秀话术片段提取要求
+你必须为每个场次额外提取“该场景类型下优秀话术片段”。
+提取标准：
+1. 必须是录音中的角色分离原话片段，保留“销售：”“客户：”这类角色区分
+2. 片段优先体现客户类型特征，以及销售针对该类型客户的有效推进话术
+3. 有效的定义包括：推动成交进程、让客户继续提问、让客户进入下一阶段、改变客户状态、或体现高质量销售展业能力
+4. 不要提取过于通用、放到任何客户身上都成立的空泛话术
+5. 如果有多条片段，请合并在一个字段里，用“1.”“2.”“3.”分条，但仍然是单个字段、单行文本
+6. 除非录音极短或几乎没有有效推进，否则默认尽量提取2到4条有效片段，而不是只提取1条
+7. 每条优秀话术片段尽量是多轮对话片段，而不是单句摘录。优先输出至少包含1轮客户表达和1到3轮销售回应的连续对话，最好能看出前因后果与推进效果
+
+# 13 个固定评分特征
+你必须对每个场次固定输出以下 13 个特征，顺序也必须固定：
+1. 客户基本面及资质锚定
+2. 客户参与度
+3. 客户情绪状态
+4. 客户对产品的关注程度
+5. 客户异议提出及解决情况
+6. 客户产生非业务沟通
+7. 销售的固定流程执行
+8. 销售展业状态
+9. 销售展业产品能力
+10. 销售需求挖掘能力
+11. 销售应对客户异议
+12. 销售与客户的情感链接
+13. 销售的展业结果
+
+# 评分与证据要求
+1. 分数必须是 0 到 100 的整数，严格遵循评分细则知识库中的百分制标准
+2. 每个特征都必须给出评分原因
+3. 评分原因必须是单行中文文本，不能换行，不能出现英文标点
+4. 评分原因必须尽量引用时间戳，例如【00：12：31】
+5. 评分原因必须尽量先给出角色归因，再给出证据分析
+6. 如果某个特征完全没有体现，分数给 0，并明确写“未涉及”
+
+# 评分原因固定格式
+评分原因建议使用以下固定句式：
+对话闭环结论：本段标签【说话人X】为销售，【说话人Y】为主要客户，【说话人Z】为旁人。具体分析：……
+
+# 输出格式铁律
+1. 只允许输出 CSV 内容，不要输出 Markdown，不要输出解释，不要输出代码块
+2. 不要输出文件名列
+3. 只允许输出 4 列：沟通ID,特征,分数,评分原因
+4. 不要重复表头。如果你输出表头，也只能出现一次
+5. 每个场次必须完整输出 16 行，顺序固定如下：
+第1行：沟通ID,客户类型,0,客户类型名称
+第2行：沟通ID,客户类型判断原因,0,判断原因
+第3行：沟通ID,该场景类型下优秀话术片段,0,角色分离原文片段
+第4至第16行：13个评分特征，按固定顺序输出，分数为0到100整数
+"""
+
+
+class SalesQAWorkflowV6:
+    def __init__(
+        self,
+        api_key: str,
+        output_dir: Path,
+        knowledge_dir: Path,
+        qa_workers: int = 2,
+        max_analysis_attempts: int = 2,
+        http_attempts: int = 3,
+        qa_model: str = "qwen3.5-omni-plus",
+    ) -> None:
+        self.api_key = api_key.strip()
+        if not self.api_key:
+            raise ValueError("API Key 为空，请在环境变量 DASHSCOPE_API_KEY 或脚本参数中提供。")
+
+        self.base_url = "https://dashscope.aliyuncs.com/api/v1"
+        self.chat_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        self.qa_model = qa_model
+        self.qa_workers = max(1, qa_workers)
+        self.max_analysis_attempts = max(1, max_analysis_attempts)
+        self.http_attempts = max(1, http_attempts)
+        self.default_timeout = 60
+        self.upload_timeout = 1800
+        self.chat_timeout = 3600
+
+        self.output_dir = output_dir
+        self.knowledge_dir = knowledge_dir
+        self.state_dir = self.output_dir / "workflow_v6_state"
+        self.raw_output_dir = self.state_dir / "omni_raw"
+        self.file_result_dir = self.state_dir / "file_results"
+        self.log_dir = self.state_dir / "logs"
+        self.manifest_path = self.state_dir / "manifest.json"
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_output_path = self.output_dir / "汇总宽表_v6.csv"
+        self.latest_wide_output_path = self.run_output_path
+        self.run_long_output_path = self.output_dir / "测试汇总表_qwen3.5-omni-plus.csv"
+        self.latest_long_output_path = self.run_long_output_path
+        self.stable_long_output_path = self.output_dir / "测试汇总表_qwen3.5-omni-plus.csv"
+        self.fallback_long_output_path = self.output_dir / f"测试汇总表_qwen3.5-omni-plus_{self.run_id}.csv"
+
+        for directory in [
+            self.output_dir,
+            self.state_dir,
+            self.raw_output_dir,
+            self.file_result_dir,
+            self.log_dir,
+        ]:
+            directory.mkdir(parents=True, exist_ok=True)
+
+        self.logger = self._build_logger()
+        self.state_lock = threading.Lock()
+        self.thread_local = threading.local()
+        self.manifest = self._load_manifest()
+        self.knowledge_bases = self._load_knowledge_bases()
+        self.system_prompt = self._build_system_prompt()
+
+        self.logger.info("V6 工作流已初始化。")
+        self.logger.info("模型：%s，分析并发：%s", self.qa_model, self.qa_workers)
+
+    def _build_logger(self) -> logging.Logger:
+        logger = logging.getLogger(f"SalesQAWorkflowV6_{self.run_id}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        if logger.handlers:
+            logger.handlers.clear()
+
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        file_handler = logging.FileHandler(self.log_dir / f"workflow_v6_{self.run_id}.log", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+        return logger
+
+    def _get_session(self) -> requests.Session:
+        session = getattr(self.thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            pool_size = max(16, self.qa_workers + 8)
+            adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            self.thread_local.session = session
+        return session
+
+    def _auth_headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        json_payload: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Any]] = None,
+        timeout: int = 60,
+        attempts: int = 3,
+        accepted_statuses: Optional[List[int]] = None,
+    ) -> requests.Response:
+        accepted = accepted_statuses or [200]
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._get_session().request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_payload,
+                    files=files,
+                    timeout=timeout,
+                )
+                if response.status_code in accepted:
+                    return response
+
+                error = RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+                last_error = error
+                if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts:
+                    self.logger.warning("请求失败，准备重试 %s %s，第 %s 次：%s", method, url, attempt, error)
+                    time.sleep(self._backoff_delay(attempt))
+                    continue
+                raise error
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < attempts:
+                    self.logger.warning("网络异常，准备重试 %s %s，第 %s 次：%s", method, url, attempt, exc)
+                    time.sleep(self._backoff_delay(attempt))
+                    continue
+                break
+
+        raise RuntimeError(f"{method} {url} 请求失败：{last_error}")
+
+    def _request_json(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        response = self._request(*args, **kwargs)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"接口返回非 JSON 数据：{exc}") from exc
+
+    def _backoff_delay(self, attempt: int) -> int:
+        return min(30, 2 ** (attempt - 1) * 2)
+
+    def _load_knowledge_bases(self) -> Dict[str, str]:
+        loaded: Dict[str, str] = {}
+        if not self.knowledge_dir.exists():
+            self.logger.info("未发现 knowledge_bases 目录，跳过知识库加载。")
+            return loaded
+
+        for path in sorted(self.knowledge_dir.glob("*.md")):
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+            except UnicodeDecodeError:
+                content = path.read_text(encoding="utf-8-sig").strip()
+            if content:
+                loaded[path.stem] = content
+
+        if "评分细则知识库" not in loaded:
+            raise ValueError("评分细则知识库为空或不存在，已中止运行。")
+        if "客情锚定" not in loaded:
+            raise ValueError("客情锚定知识库为空或不存在，已中止运行。")
+
+        self.logger.info("已加载非空知识库文件 %s 个。", len(loaded))
+        self.logger.info("已加载知识库：%s", "、".join(sorted(loaded.keys())))
+        return loaded
+
+    def _build_system_prompt(self) -> str:
+        sections = [BASE_SYSTEM_PROMPT]
+
+        if self.knowledge_bases:
+            sections.append("# 知识库使用说明")
+            sections.append("若基础提示与评分细则知识库有冲突，必须优先遵循评分细则知识库。")
+            sections.append("若知识库与音频事实冲突，必须以音频中真实可听见的事实为准。")
+            for title, content in self.knowledge_bases.items():
+                sections.append(f"## {title}")
+                sections.append(content)
+
+        return "\n\n".join(sections)
+
+    def _now_iso(self) -> str:
+        return datetime.now().isoformat(timespec="seconds")
+
+    def _safe_stem(self, file_stem: str) -> str:
+        safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", file_stem).strip("_")
+        return safe[:60] or "audio"
+
+    def _build_file_id(self, file_path: Path, file_size: int, modified_time: float) -> str:
+        raw = f"{file_path.resolve()}|{file_size}|{int(modified_time)}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+    def _empty_manifest(self) -> Dict[str, Any]:
+        return {"manifest_version": 1, "updated_at": self._now_iso(), "files": {}}
+
+    def _load_manifest(self) -> Dict[str, Any]:
+        if not self.manifest_path.exists():
+            return self._empty_manifest()
+
+        try:
+            with self.manifest_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            self.logger.warning("manifest.json 读取失败，已自动重建。")
+            return self._empty_manifest()
+
+        if not isinstance(data, dict):
+            return self._empty_manifest()
+
+        data.setdefault("manifest_version", 1)
+        data.setdefault("updated_at", self._now_iso())
+        data.setdefault("files", {})
+        return data
+
+    def _atomic_write_text(self, path: Path, content: str, encoding: str = "utf-8") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with temp_path.open("w", encoding=encoding, newline="") as handle:
+            handle.write(content)
+        os.replace(temp_path, path)
+
+    def _atomic_write_json(self, path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+
+    def _atomic_write_csv(self, path: Path, rows: List[List[str]], header: List[str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(rows)
+        os.replace(temp_path, path)
+
+    def _write_primary_or_fallback_csv(self, path: Path, rows: List[List[str]], header: List[str], fallback_path: Optional[Path] = None) -> Path:
+        try:
+            self._atomic_write_csv(path, rows, header=header)
+            return path
+        except PermissionError:
+            if not fallback_path:
+                raise
+            self.logger.warning("目标文件被占用，改为写入备用文件：%s", fallback_path)
+            self._atomic_write_csv(fallback_path, rows, header=header)
+            return fallback_path
+
+    def _display_path(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.output_dir))
+        except ValueError:
+            return str(path)
+
+    def _copy_if_exists(self, source: Path, target: Path) -> None:
+        if not source.exists():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copyfile(source, target)
+        except PermissionError:
+            self.logger.warning("目标文件被占用，暂时跳过同步：%s", target)
+
+    def _save_manifest(self) -> None:
+        with self.state_lock:
+            self.manifest["updated_at"] = self._now_iso()
+            self._atomic_write_json(self.manifest_path, self.manifest)
+
+    def _upsert_entry(self, entry: Dict[str, Any]) -> None:
+        with self.state_lock:
+            entry["updated_at"] = self._now_iso()
+            self.manifest["files"][entry["file_id"]] = entry.copy()
+            self.manifest["updated_at"] = entry["updated_at"]
+            self._atomic_write_json(self.manifest_path, self.manifest)
+
+    def _reset_analysis_state(self, entry: Dict[str, Any]) -> None:
+        entry["analysis_status"] = "pending"
+        entry["analysis_attempts"] = 0
+        entry["row_count"] = 0
+        entry["error_message"] = ""
+        entry["analysis_completed_at"] = ""
+
+    def prepare_entries(
+        self,
+        file_paths: List[Path],
+        *,
+        force_reanalyze: bool = False,
+    ) -> List[Dict[str, Any]]:
+        current_entries: List[Dict[str, Any]] = []
+
+        for index, file_path in enumerate(file_paths, start=1):
+            stat = file_path.stat()
+            file_id = self._build_file_id(file_path, stat.st_size, stat.st_mtime)
+            safe_stem = self._safe_stem(file_path.stem)
+            artifact_prefix = f"{safe_stem}_{file_id}"
+            raw_output_path = self.raw_output_dir / f"omni原始输出_{artifact_prefix}.txt"
+            result_json_path = self.file_result_dir / f"结果_{artifact_prefix}.json"
+            result_csv_path = self.file_result_dir / f"结果_{artifact_prefix}.csv"
+
+            existing = self.manifest["files"].get(file_id, {})
+            entry: Dict[str, Any] = {
+                "file_id": file_id,
+                "run_index": index,
+                "source_path": str(file_path.resolve()),
+                "source_name": file_path.name,
+                "source_size": stat.st_size,
+                "source_mtime": int(stat.st_mtime),
+                "audio_format": self.detect_audio_format(file_path),
+                "artifact_prefix": artifact_prefix,
+                "raw_output_path": str(raw_output_path),
+                "result_json_path": str(result_json_path),
+                "result_csv_path": str(result_csv_path),
+                "analysis_status": "pending",
+                "analysis_attempts": 0,
+                "row_count": 0,
+                "error_message": "",
+                "selected_at": self._now_iso(),
+                "updated_at": self._now_iso(),
+                "analysis_completed_at": "",
+                "last_uploaded_audio_url": "",
+            }
+            entry.update(existing)
+            entry["run_index"] = index
+            entry["source_path"] = str(file_path.resolve())
+            entry["source_name"] = file_path.name
+            entry["source_size"] = stat.st_size
+            entry["source_mtime"] = int(stat.st_mtime)
+            entry["audio_format"] = self.detect_audio_format(file_path)
+            entry["artifact_prefix"] = artifact_prefix
+            entry["raw_output_path"] = str(raw_output_path)
+            entry["result_json_path"] = str(result_json_path)
+            entry["result_csv_path"] = str(result_csv_path)
+
+            if force_reanalyze:
+                self._reset_analysis_state(entry)
+            else:
+                result_rows = self._read_result_rows(Path(entry["result_json_path"]))
+                if result_rows:
+                    entry["analysis_status"] = "succeeded"
+                    entry["row_count"] = len(result_rows)
+                    entry["error_message"] = ""
+                elif entry.get("analysis_status") == "succeeded":
+                    self._reset_analysis_state(entry)
+                elif entry.get("analysis_status") == "failed":
+                    entry["analysis_status"] = "pending"
+                    entry["analysis_attempts"] = 0
+
+            self._upsert_entry(entry)
+            current_entries.append(entry)
+
+        return current_entries
+
+    def discover_audio_files(self, input_dir: Path, patterns: List[str], max_files: int = 0) -> List[Path]:
+        files: Dict[str, Path] = {}
+        for pattern in patterns:
+            for path in sorted(input_dir.glob(pattern)):
+                if path.is_file():
+                    files[str(path.resolve()).lower()] = path
+
+        ordered_files = sorted(files.values(), key=lambda item: item.name.lower())
+        if max_files > 0:
+            ordered_files = ordered_files[:max_files]
+        return ordered_files
+
+    def detect_audio_format(self, audio_path: Path) -> str:
+        suffix = audio_path.suffix.lower().lstrip(".")
+        if suffix in {"wav", "mp3", "m4a", "aac", "amr", "flac"}:
+            return suffix
+        raise ValueError(f"不支持的音频格式：{audio_path.name}")
+
+    def upload_audio(self, entry: Dict[str, Any], attempt: int) -> str:
+        file_path = Path(entry["source_path"])
+        policy_json = self._request_json(
+            "GET",
+            f"{self.base_url}/uploads",
+            headers=self._auth_headers(),
+            params={"action": "getPolicy", "model": self.qa_model},
+            timeout=self.default_timeout,
+            attempts=self.http_attempts,
+        )
+        policy = policy_json.get("data")
+        if not policy:
+            raise RuntimeError(f"获取上传凭证失败：{policy_json}")
+
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        object_key = (
+            f"{policy['upload_dir'].rstrip('/')}/"
+            f"{self.run_id}_{entry['file_id']}_attempt{attempt}_{timestamp}_{file_path.name}"
+        )
+
+        with file_path.open("rb") as audio_file:
+            files = {
+                "key": (None, object_key),
+                "OSSAccessKeyId": (None, policy["oss_access_key_id"]),
+                "policy": (None, policy["policy"]),
+                "Signature": (None, policy["signature"]),
+                "x-oss-object-acl": (None, policy.get("x_oss_object_acl", "private")),
+                "x-oss-forbid-overwrite": (None, policy.get("x_oss_forbid_overwrite", "true")),
+                "success_action_status": (None, "200"),
+                "file": (file_path.name, audio_file),
+            }
+            self._request(
+                "POST",
+                policy["upload_host"],
+                files=files,
+                timeout=self.upload_timeout,
+                attempts=1,
+            )
+
+        audio_url = f"oss://{object_key}"
+        entry["last_uploaded_audio_url"] = audio_url
+        self._upsert_entry(entry)
+        return audio_url
+
+    def _omni_user_prompt(self, strict_mode: bool = False) -> str:
+        lines = [
+            "请直接听完整段销售录音，并严格输出 CSV 结果。",
+            "不要输出 Markdown，不要输出解释，不要输出代码块。",
+            "只允许输出 4 列：沟通ID,特征,分数,评分原因。",
+            "沟通ID必须统一写为场次1、场次2、场次3……。",
+            "分数必须严格使用 0 到 100 的整数百分制，并与评分细则知识库保持一致。",
+            "每个场次必须完整输出 16 行，前 3 行是沟通级元信息，后 13 行是固定评分特征，顺序必须固定。",
+            "请充分利用音频中的语气、语速、停顿、打断、犹豫、重音、笑声、叹气、环境噪声等声学线索来增强判断。",
+            "如果判断来自声学线索，请在评分原因中明确点出该声学证据。",
+            "如果某项没有体现，分数给 0，并明确写未涉及。",
+            "评分原因必须保持单行中文，不能换行，不能包含英文标点。",
+            "客户类型必须从九宫格客情锚定知识库中选择唯一主导类型。",
+            "客户类型这一行的评分原因字段里只能写九宫格中的一个类型名，例如佛系型、迷茫型、开放型、保守型、选择型、预判型、防守型、筛选型、成熟型，不允许写解释句子。",
+            "客户类型判断原因必须说明为什么判成这个类型，并引用客户表达、行为和声学线索，且默认至少给出2条证据，不能留空。",
+            "优秀话术片段必须输出角色分离的沟通原文，优先摘取体现客户类型且销售明显有效推进的针对性话术。",
+            "优秀话术片段默认尽量提取2到4条，只要录音里存在足够多的有效片段，就不要只提取1条。",
+            "每条优秀话术片段尽量写成多轮对话片段，而不是一句话；最好至少包含客户一句和销售一到三句连续回应。",
+            "如果优秀话术片段有多条，请在同一个字段里用1.2.3.分条输出，不要拆成多行。",
+            "",
+            "固定输出顺序如下：",
+            "1. 客户类型",
+            "2. 客户类型判断原因",
+            "3. 该场景类型下优秀话术片段",
+        ]
+        for index, feature in enumerate(FEATURE_ORDER, start=1):
+            lines.append(f"{index + 3}. {feature}")
+        if strict_mode:
+            lines.extend(
+                [
+                    "",
+                    "你上一轮输出的格式不够稳定，这一轮必须严格满足以下要求：",
+                    "1. 每个场次恰好 16 行",
+                    "2. 第1到3行必须是客户类型、客户类型判断原因、该场景类型下优秀话术片段",
+                    "3. 第4到16行的特征名称必须与给定列表完全一致",
+                    "4. 不要丢字段，不要加额外列，不要改写沟通ID格式",
+                    "5. 分数只能是 0 到 100 的整数；其中前3行固定写0，后13行才是真实评分",
+                    "6. 第1行只能输出九宫格中的一个客户类型名，绝对不要输出判断原因",
+                    "7. 第2行客户类型判断原因绝对不能留空，必须提供原文证据",
+                    "8. 第3行优秀话术片段尽量输出多轮对话，不要只摘一句话",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _extract_message_text(self, response: Dict[str, Any]) -> str:
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"模型响应异常：{response}") from exc
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content") or ""
+                    if text:
+                        parts.append(str(text))
+            joined = "".join(parts).strip()
+            if joined:
+                return joined
+
+        raise RuntimeError(f"无法从模型响应中提取文本：{response}")
+
+    def analyze_audio(self, entry: Dict[str, Any], strict_mode: bool = False) -> str:
+        audio_url = self.upload_audio(entry, entry.get("analysis_attempts", 1))
+        payload = {
+            "model": self.qa_model,
+            "temperature": 0,
+            "max_tokens": 16000,
+            "modalities": ["text"],
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": audio_url,
+                                "format": entry["audio_format"],
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": self._omni_user_prompt(strict_mode=strict_mode),
+                        },
+                    ],
+                },
+            ],
+        }
+        response = self._request_json(
+            "POST",
+            self.chat_url,
+            headers={
+                **self._auth_headers(),
+                "Content-Type": "application/json",
+                "X-DashScope-OssResourceResolve": "enable",
+            },
+            json_payload=payload,
+            timeout=self.chat_timeout,
+            attempts=self.http_attempts,
+        )
+        return self._extract_message_text(response).strip()
+
+    def _sanitize_reason(self, reason: str) -> str:
+        cleaned = reason.replace("\r", " ").replace("\n", " ").strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.translate(ASCII_PUNCT_TRANSLATION)
+        return cleaned
+
+    def _normalize_score(self, raw_score: str) -> Optional[int]:
+        match = re.search(r"\d+", raw_score or "")
+        if not match:
+            return None
+        value = int(match.group())
+        if 0 <= value <= 100:
+            return value
+        return None
+
+    def _normalize_feature_name(self, feature: str) -> Optional[str]:
+        key = normalize_text_key(feature)
+        if key in FEATURE_NAME_MAP:
+            return FEATURE_NAME_MAP[key]
+
+        for canonical_feature in FEATURE_ORDER:
+            canonical_key = normalize_text_key(canonical_feature)
+            if key and (key in canonical_key or canonical_key in key):
+                return canonical_feature
+        return None
+
+    def _normalize_meta_feature_name(self, feature: str) -> Optional[str]:
+        key = normalize_text_key(feature)
+        for meta_feature in META_FEATURES:
+            meta_key = normalize_text_key(meta_feature)
+            if key == meta_key or (key and (key in meta_key or meta_key in key)):
+                return meta_feature
+        return None
+
+    def _strip_markdown(self, raw_text: str) -> str:
+        text = raw_text.replace("\ufeff", "").strip()
+        text = re.sub(r"```(?:csv)?", "", text, flags=re.IGNORECASE)
+        return text.replace("```", "").strip()
+
+    def _sanitize_meta_value(self, value: str) -> str:
+        cleaned = value.replace("\r", " ").replace("\n", " ").strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.translate(ASCII_PUNCT_TRANSLATION)
+        return cleaned
+
+    def _extract_customer_type_name(self, value: str) -> str:
+        for customer_type in CUSTOMER_TYPE_NAMES:
+            if customer_type in value:
+                return customer_type
+        return value.strip()
+
+    def _extract_meta_from_raw_text(self, text: str, communication_id: str, meta_feature: str) -> str:
+        escaped_comm = re.escape(communication_id)
+        escaped_feature = re.escape(meta_feature)
+        pattern = rf"{escaped_comm}\s*,\s*{escaped_feature}\s*,\s*[^,]*\s*,\s*(.+)"
+        match = re.search(pattern, text)
+        if not match:
+            return ""
+        return self._sanitize_meta_value(match.group(1))
+
+    def _dense_rows_from_parsed_items(
+        self,
+        source_name: str,
+        parsed_items: List[Dict[str, Any]],
+        meta_items: List[Dict[str, Any]],
+        *,
+        allow_fill_missing: bool,
+    ) -> List[Dict[str, Any]]:
+        grouped: Dict[str, Dict[str, Dict[str, str]]] = {}
+        communication_order: List[str] = []
+        grouped_meta: Dict[str, Dict[str, str]] = {}
+
+        for item in parsed_items:
+            raw_communication_id = item["communication_id"] or "场次1"
+            if raw_communication_id not in grouped:
+                grouped[raw_communication_id] = {}
+                communication_order.append(raw_communication_id)
+
+            feature = item["feature"]
+            existing = grouped[raw_communication_id].get(feature)
+            if existing is None or len(item["reason"]) > len(existing["reason"]):
+                grouped[raw_communication_id][feature] = {
+                    "score": item["score"],
+                    "reason": item["reason"],
+                }
+
+        for item in meta_items:
+            raw_communication_id = item["communication_id"] or "场次1"
+            if raw_communication_id not in grouped:
+                grouped[raw_communication_id] = {}
+                communication_order.append(raw_communication_id)
+            grouped_meta.setdefault(raw_communication_id, {})[item["feature"]] = item["value"]
+
+        if not communication_order:
+            raise RuntimeError("模型输出中未识别到任何有效场次。")
+
+        scene_results: List[Dict[str, Any]] = []
+        missing_messages: List[str] = []
+
+        for scene_index, raw_communication_id in enumerate(communication_order, start=1):
+            normalized_communication_id = f"场次{scene_index}"
+            feature_map = grouped[raw_communication_id]
+            meta_map = grouped_meta.get(raw_communication_id, {})
+            rows: List[List[str]] = []
+            for feature in FEATURE_ORDER:
+                if feature in feature_map:
+                    rows.append(
+                        [
+                            source_name,
+                            normalized_communication_id,
+                            feature,
+                            feature_map[feature]["score"],
+                            feature_map[feature]["reason"],
+                        ]
+                    )
+                else:
+                    missing_messages.append(f"{normalized_communication_id} 缺少特征 {feature}")
+                    if allow_fill_missing:
+                        rows.append(
+                            [
+                                source_name,
+                                normalized_communication_id,
+                                feature,
+                                "0",
+                                "对话闭环结论：本段标签【待复核】未能从模型输出中完整识别。具体分析：模型本次未返回该特征行，程序按缺失补零，建议结合音频与原始输出人工复核。",
+                            ]
+                        )
+
+            scene_results.append(
+                {
+                    "file_name": source_name,
+                    "communication_id": normalized_communication_id,
+                    "customer_type": meta_map.get("客户类型", ""),
+                    "customer_type_reason": meta_map.get("客户类型判断原因", ""),
+                    "best_script_snippets": meta_map.get("该场景类型下优秀话术片段", ""),
+                    "rows": rows,
+                }
+            )
+
+        if missing_messages and not allow_fill_missing:
+            preview = "；".join(missing_messages[:8])
+            raise RuntimeError(f"模型输出特征不完整：{preview}")
+
+        return scene_results
+
+    def parse_qa_output(
+        self,
+        raw_output: str,
+        source_name: str,
+        *,
+        allow_fill_missing: bool = False,
+    ) -> List[Dict[str, Any]]:
+        text = self._strip_markdown(raw_output)
+        parsed_items: List[Dict[str, str]] = []
+        meta_items: List[Dict[str, str]] = []
+        invalid_lines: List[str] = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if "沟通ID" in line and "评分原因" in line:
+                continue
+            if line.startswith("文件名"):
+                continue
+
+            try:
+                parsed = next(csv.reader([line]))
+            except Exception:
+                parsed = line.split(",", 3)
+
+            if len(parsed) < 4:
+                invalid_lines.append(line)
+                continue
+
+            if len(parsed) > 4:
+                first_cell = parsed[0].strip().lower()
+                if first_cell.endswith((".wav", ".mp3", ".m4a", ".aac", ".amr", ".flac")) or "文件名" in parsed[0]:
+                    parsed = parsed[-4:]
+                else:
+                    parsed = [parsed[0], parsed[1], parsed[2], ",".join(parsed[3:])]
+
+            communication_id = parsed[0].strip()
+            raw_feature = parsed[1].strip()
+            meta_feature = self._normalize_meta_feature_name(raw_feature)
+            feature = self._normalize_feature_name(raw_feature)
+            score_text = parsed[2].strip()
+            reason = self._sanitize_reason(parsed[3].strip())
+
+            if communication_id == "沟通ID" or raw_feature == "特征":
+                continue
+            if meta_feature:
+                meta_value = self._sanitize_meta_value(parsed[3].strip())
+                if not meta_value:
+                    invalid_lines.append(line)
+                    continue
+                if meta_feature == "客户类型":
+                    meta_value = self._extract_customer_type_name(meta_value)
+                meta_items.append(
+                    {
+                        "communication_id": communication_id,
+                        "feature": meta_feature,
+                        "value": meta_value,
+                    }
+                )
+                continue
+
+            score = self._normalize_score(score_text)
+            if not feature or score is None or not reason:
+                invalid_lines.append(line)
+                continue
+
+            parsed_items.append(
+                {
+                    "communication_id": communication_id,
+                    "feature": feature,
+                    "score": str(score),
+                    "reason": reason,
+                }
+            )
+
+        if not parsed_items:
+            raise RuntimeError(f"模型输出未解析到有效 CSV 行。原始输出：{text[:1200]}")
+
+        if invalid_lines:
+            self.logger.warning("文件 [%s] 存在 %s 行无法解析，已自动跳过。", source_name, len(invalid_lines))
+
+        scene_results = self._dense_rows_from_parsed_items(
+            source_name,
+            parsed_items,
+            meta_items,
+            allow_fill_missing=allow_fill_missing,
+        )
+
+        for scene in scene_results:
+            communication_id = scene["communication_id"]
+            if not scene.get("customer_type_reason"):
+                scene["customer_type_reason"] = self._extract_meta_from_raw_text(text, communication_id, "客户类型判断原因")
+            if not scene.get("best_script_snippets"):
+                scene["best_script_snippets"] = self._extract_meta_from_raw_text(text, communication_id, "该场景类型下优秀话术片段")
+            if scene.get("customer_type"):
+                scene["customer_type"] = self._extract_customer_type_name(scene["customer_type"])
+
+        return scene_results
+
+    def _flatten_scene_results(self, scene_results: List[Dict[str, Any]]) -> List[List[str]]:
+        rows: List[List[str]] = []
+        for scene in scene_results:
+            communication_id = scene["communication_id"]
+            if scene.get("customer_type"):
+                rows.append([scene["file_name"], communication_id, "客户类型", "0", scene["customer_type"]])
+            if scene.get("customer_type_reason"):
+                rows.append([scene["file_name"], communication_id, "客户类型判断原因", "0", scene["customer_type_reason"]])
+            if scene.get("best_script_snippets"):
+                rows.append([scene["file_name"], communication_id, "该场景类型下优秀话术片段", "0", scene["best_script_snippets"]])
+            rows.extend(scene["rows"])
+        return rows
+
+    def _write_result_csv(self, path: Path, scene_results: List[Dict[str, Any]]) -> None:
+        header = ["文件名", "沟通ID", "特征", "分数", "评分原因"]
+        self._atomic_write_csv(path, self._flatten_scene_results(scene_results), header=header)
+
+    def run_analysis_pipeline(self, entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+        last_error = ""
+        for attempt in range(entry.get("analysis_attempts", 0) + 1, self.max_analysis_attempts + 1):
+            try:
+                entry["analysis_status"] = "running"
+                entry["analysis_attempts"] = attempt
+                entry["error_message"] = ""
+                self._upsert_entry(entry)
+
+                raw_output = self.analyze_audio(entry, strict_mode=attempt > 1)
+                raw_path = Path(entry["raw_output_path"])
+                if attempt == 1:
+                    output_path = raw_path
+                else:
+                    output_path = raw_path.with_name(f"{raw_path.stem}_attempt{attempt}{raw_path.suffix}")
+                self._atomic_write_text(output_path, raw_output, encoding="utf-8")
+
+                scene_results = self.parse_qa_output(
+                    raw_output,
+                    entry["source_name"],
+                    allow_fill_missing=attempt == self.max_analysis_attempts,
+                )
+                flattened_rows = self._flatten_scene_results(scene_results)
+                self._atomic_write_json(Path(entry["result_json_path"]), scene_results)
+                self._write_result_csv(Path(entry["result_csv_path"]), scene_results)
+
+                entry["analysis_status"] = "succeeded"
+                entry["analysis_completed_at"] = self._now_iso()
+                entry["row_count"] = len(flattened_rows)
+                entry["error_message"] = ""
+                self._upsert_entry(entry)
+                return scene_results
+            except Exception as exc:
+                last_error = str(exc)
+                entry["analysis_status"] = "pending"
+                entry["error_message"] = last_error
+                self._upsert_entry(entry)
+                self.logger.warning("音频直分析失败 [%s] 第 %s 次：%s", entry["source_name"], attempt, last_error)
+                if attempt < self.max_analysis_attempts:
+                    time.sleep(self._backoff_delay(attempt))
+
+        raise RuntimeError(f"音频直分析失败：{last_error}")
+
+    def _read_result_rows(self, path: Path) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not path.exists():
+            return rows
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, list):
+            for row in payload:
+                if isinstance(row, dict) and row.get("communication_id") and isinstance(row.get("rows"), list):
+                    rows.append(row)
+        return rows
+
+    def _communication_sort_key(self, communication_id: str) -> tuple[int, str]:
+        match = re.search(r"(\d+)", communication_id or "")
+        return (int(match.group(1)) if match else 10**9, communication_id or "")
+
+    def _entry_status_label(self, entry: Dict[str, Any]) -> str:
+        if entry.get("analysis_status") == "succeeded":
+            return "成功"
+        if entry.get("analysis_status") == "failed":
+            return "分析失败"
+        if entry.get("analysis_status") == "running":
+            return "分析中"
+        return "待处理"
+
+    def _build_long_rows(self, entries: List[Dict[str, Any]]) -> List[List[str]]:
+        rows: List[List[str]] = []
+        for entry in sorted(entries, key=lambda item: item["run_index"]):
+            result_rows = self._read_result_rows(Path(entry["result_json_path"]))
+            if not result_rows:
+                continue
+
+            sorted_scenes = sorted(result_rows, key=lambda item: self._communication_sort_key(item["communication_id"]))
+            for scene in sorted_scenes:
+                feature_map = {row[2]: row for row in scene["rows"]}
+                recording_id = Path(scene["file_name"]).stem
+                first_row_of_scene = True
+                current_dimension = ""
+
+                for feature in FEATURE_ORDER:
+                    row = feature_map.get(feature)
+                    if not row:
+                        continue
+                    dimension = DIMENSION_BY_FEATURE[feature]
+                    show_dimension = dimension if dimension != current_dimension else ""
+                    current_dimension = dimension
+                    rows.append(
+                        [
+                            recording_id,
+                            scene["communication_id"],
+                            scene["customer_type"] if first_row_of_scene else "",
+                            scene["customer_type_reason"] if first_row_of_scene else "",
+                            show_dimension,
+                            feature,
+                            FEATURE_WEIGHT_MAP.get(feature, ""),
+                            row[3],
+                            row[4],
+                            scene["best_script_snippets"] if first_row_of_scene else "",
+                        ]
+                    )
+                    first_row_of_scene = False
+        return rows
+
+    def _sync_latest_outputs(self) -> None:
+        if self.latest_wide_output_path != self.run_output_path:
+            self._copy_if_exists(self.run_output_path, self.latest_wide_output_path)
+        if self.latest_long_output_path != self.run_long_output_path:
+            self._copy_if_exists(self.run_long_output_path, self.latest_long_output_path)
+        if self.stable_long_output_path != self.run_long_output_path:
+            self._copy_if_exists(self.run_long_output_path, self.stable_long_output_path)
+
+    def rebuild_outputs(self, entries: List[Dict[str, Any]]) -> None:
+        header = ["文件名", "沟通ID", "处理状态", "错误信息", "模型原始输出路径", "客户类型", "客户类型判断原因", "该场景类型下优秀话术片段"]
+        for feature in FEATURE_ORDER:
+            header.append(f"{feature}_权重")
+            header.append(f"{feature}_分数")
+            header.append(f"{feature}_评分原因")
+
+        wide_rows: List[List[str]] = []
+
+        for entry in sorted(entries, key=lambda item: item["run_index"]):
+            result_rows = self._read_result_rows(Path(entry["result_json_path"]))
+            raw_output_path = self._display_path(Path(entry["raw_output_path"]))
+            if result_rows:
+                grouped: Dict[str, Dict[str, str]] = {}
+                for scene in result_rows:
+                    file_name = scene["file_name"]
+                    communication_id = scene["communication_id"]
+                    row_map = grouped.setdefault(
+                        communication_id,
+                        {
+                            "文件名": file_name,
+                            "沟通ID": communication_id,
+                            "处理状态": "成功",
+                            "错误信息": "",
+                            "模型原始输出路径": raw_output_path,
+                            "客户类型": scene.get("customer_type", ""),
+                            "客户类型判断原因": scene.get("customer_type_reason", ""),
+                            "该场景类型下优秀话术片段": scene.get("best_script_snippets", ""),
+                        },
+                    )
+                    for _, _, feature, score, reason in scene["rows"]:
+                        row_map[f"{feature}_权重"] = FEATURE_WEIGHT_MAP.get(feature, "")
+                        row_map[f"{feature}_分数"] = score
+                        row_map[f"{feature}_评分原因"] = reason
+
+                for communication_id in sorted(grouped.keys(), key=self._communication_sort_key):
+                    row_map = grouped[communication_id]
+                    wide_rows.append([row_map.get(column, "") for column in header])
+            else:
+                row_map = {
+                    "文件名": entry.get("source_name", ""),
+                    "沟通ID": "",
+                    "处理状态": self._entry_status_label(entry),
+                    "错误信息": entry.get("error_message", ""),
+                    "模型原始输出路径": raw_output_path if Path(entry["raw_output_path"]).exists() else "",
+                }
+                wide_rows.append([row_map.get(column, "") for column in header])
+
+        self._atomic_write_csv(self.run_output_path, wide_rows, header=header)
+
+        long_header = ["录音ID", "沟通ID", "客户类型", "客户类型判断原因", "维度", "特征", "特征权重", "特征评分", "评分原因", "该场景类型下优秀话术片段"]
+        long_rows = self._build_long_rows(entries)
+        final_long_output_path = self._write_primary_or_fallback_csv(
+            self.run_long_output_path,
+            long_rows,
+            header=long_header,
+            fallback_path=self.fallback_long_output_path,
+        )
+        self.run_long_output_path = final_long_output_path
+        self._sync_latest_outputs()
+
+    def _progress_snapshot(self, entries: List[Dict[str, Any]]) -> Dict[str, int]:
+        stats = {"total": len(entries), "done": 0, "failed": 0, "pending": 0, "running": 0}
+        for entry in entries:
+            status = entry.get("analysis_status")
+            if status == "succeeded":
+                stats["done"] += 1
+            elif status == "failed":
+                stats["failed"] += 1
+            elif status == "running":
+                stats["running"] += 1
+            else:
+                stats["pending"] += 1
+        return stats
+
+    def _schedule_jobs(
+        self,
+        pending_entries: List[Dict[str, Any]],
+        futures: Dict[Future[List[List[str]]], Dict[str, Any]],
+        pool: ThreadPoolExecutor,
+    ) -> None:
+        while pending_entries and len(futures) < self.qa_workers:
+            entry = pending_entries.pop(0)
+            future = pool.submit(self.run_analysis_pipeline, entry)
+            futures[future] = entry
+
+    def run_batch(
+        self,
+        file_paths: List[Path],
+        *,
+        force_reanalyze: bool = False,
+    ) -> None:
+        entries = self.prepare_entries(file_paths, force_reanalyze=force_reanalyze)
+        if not entries:
+            self.logger.info("未发现可处理的录音文件。")
+            return
+
+        self.rebuild_outputs(entries)
+        pending_entries = [entry for entry in entries if entry.get("analysis_status") != "succeeded"]
+
+        self.logger.info(
+            "开始批处理：总文件 %s，待全模态分析 %s。",
+            len(entries),
+            len(pending_entries),
+        )
+
+        last_log_at = 0.0
+
+        with ThreadPoolExecutor(max_workers=self.qa_workers) as pool:
+            futures: Dict[Future[List[List[str]]], Dict[str, Any]] = {}
+            self._schedule_jobs(pending_entries, futures, pool)
+
+            while futures or pending_entries:
+                if futures:
+                    done_futures, _ = wait(list(futures.keys()), timeout=1, return_when=FIRST_COMPLETED)
+                else:
+                    done_futures = set()
+
+                progress_made = False
+
+                for future in done_futures:
+                    progress_made = True
+                    entry = futures.pop(future)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        entry["analysis_status"] = "failed"
+                        entry["error_message"] = str(exc)
+                        self._upsert_entry(entry)
+                        self.logger.error("全模态分析最终失败 [%s]：%s", entry["source_name"], exc)
+                    finally:
+                        self.rebuild_outputs(entries)
+
+                self._schedule_jobs(pending_entries, futures, pool)
+
+                if time.time() - last_log_at >= 30:
+                    snapshot = self._progress_snapshot(entries)
+                    self.logger.info(
+                        "进度：总数 %s，完成 %s，失败 %s，运行中 %s，待处理 %s。",
+                        snapshot["total"],
+                        snapshot["done"],
+                        snapshot["failed"],
+                        snapshot["running"],
+                        snapshot["pending"],
+                    )
+                    last_log_at = time.time()
+
+                if not progress_made:
+                    time.sleep(1)
+
+        self.rebuild_outputs(entries)
+        snapshot = self._progress_snapshot(entries)
+        self.logger.info(
+            "批处理结束：总数 %s，完成 %s，失败 %s。",
+            snapshot["total"],
+            snapshot["done"],
+            snapshot["failed"],
+        )
+        self.logger.info("汇总宽表：%s", self.run_output_path)
+        self.logger.info("测试汇总表：%s", self.run_long_output_path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="销售录音质检工作流 V6")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="DashScope API Key")
+    parser.add_argument("--input-dir", default=str(DEFAULT_INPUT_DIR), help="录音文件目录")
+    parser.add_argument("--output-dir", default=str(DEFAULT_WORKSPACE), help="输出目录")
+    parser.add_argument("--knowledge-dir", default=str(DEFAULT_WORKSPACE / "knowledge_bases"), help="知识库目录")
+    parser.add_argument("--patterns", nargs="*", default=SUPPORTED_PATTERNS, help="录音文件匹配模式")
+    parser.add_argument("--max-files", type=int, default=0, help="限制本次最多处理多少个文件，0 表示不限制")
+    parser.add_argument("--qa-workers", type=int, default=2, help="全模态分析并发数")
+    parser.add_argument("--max-analysis-attempts", type=int, default=2, help="单文件最大分析重试次数")
+    parser.add_argument("--force-reanalyze", action="store_true", help="忽略已有结果，重新跑全部全模态质检")
+
+    # 兼容 V5 的保留参数，避免命令切换时用户心智负担过大
+    parser.add_argument("--submit-workers", type=int, default=0, help="兼容 V5 的保留参数，V6 不使用")
+    parser.add_argument("--poll-workers", type=int, default=0, help="兼容 V5 的保留参数，V6 不使用")
+    parser.add_argument("--max-inflight-asr", type=int, default=0, help="兼容 V5 的保留参数，V6 不使用")
+    parser.add_argument("--poll-interval", type=int, default=0, help="兼容 V5 的保留参数，V6 不使用")
+    parser.add_argument("--force-retranscribe", action="store_true", help="兼容参数，V6 中等价于重新跑全部分析")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    knowledge_dir = Path(args.knowledge_dir)
+
+    if not input_dir.exists():
+        print(f"输入目录不存在：{input_dir}")
+        return 1
+
+    workflow = SalesQAWorkflowV6(
+        api_key=args.api_key,
+        output_dir=output_dir,
+        knowledge_dir=knowledge_dir,
+        qa_workers=args.qa_workers,
+        max_analysis_attempts=args.max_analysis_attempts,
+    )
+
+    file_paths = workflow.discover_audio_files(input_dir, args.patterns, max_files=args.max_files)
+    if not file_paths:
+        workflow.logger.info("目录下未找到匹配的录音文件。")
+        return 0
+
+    force_reanalyze = args.force_reanalyze or args.force_retranscribe
+    workflow.run_batch(file_paths, force_reanalyze=force_reanalyze)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
