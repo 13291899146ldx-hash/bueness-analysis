@@ -1,0 +1,660 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+
+
+DEFAULT_API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-cc583ed891f6489eb4d4f7d7b2a380db")
+DEFAULT_MODEL = "qwen3.5-omni-plus"
+DEFAULT_WORKSPACE = Path(r"D:\audieo")
+DEFAULT_INPUT_DIR = DEFAULT_WORKSPACE / "audio_data(A)"
+DEFAULT_OUTPUT_DIR = DEFAULT_WORKSPACE / "omni_scene_industry_output"
+DEFAULT_KNOWLEDGE_DIR = DEFAULT_WORKSPACE / "knowledge_bases"
+
+SCENE_KB_NAME = "场景及客户行为分类体系知识库.md"
+INDUSTRY_KB_NAME = "客户行业及主营产品分类知识库.md"
+STRATEGY_KB_NAME = "销售策略及销售话术知识库.md"
+
+SUPPORTED_PATTERNS = ["*.wav", "*.mp3", "*.m4a", "*.aac", "*.amr", "*.flac"]
+RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+SUMMARY_HEADERS = [
+    "录音ID",
+    "沟通ID",
+    "场景及客户类型",
+    "场景及客户类型依据",
+    "客户行业及产品类型",
+    "客户行业及产品类型依据",
+    "销售策略",
+    "销售策略依据",
+    "具体话术总结",
+]
+
+SCENE_TYPES = [
+    "快速拦截场景",
+    "正常沟通场景",
+    "深度会谈场景",
+    "群体影响场景",
+]
+
+CUSTOMER_TYPES = [
+    "资金紧急型",
+    "价格敏感型",
+    "保守观望型",
+    "成熟借贷型",
+    "模糊探索型",
+    "非目标客户",
+]
+
+STRATEGY_TYPES = [
+    "快速筛选+推进策略",
+    "客户痛点放大策略",
+    "成本重构策略",
+    "信任建立策略",
+    "对比决策策略",
+    "试探教育策略",
+    "紧迫锁单策略",
+    "信息留存策略",
+]
+
+UNKNOWN_LABEL = "未能根据知识库判断"
+
+
+class OmniSceneIndustryWorkflow:
+    def __init__(
+        self,
+        api_key: str,
+        input_dir: Path,
+        output_dir: Path,
+        knowledge_dir: Path,
+        model: str = DEFAULT_MODEL,
+        http_attempts: int = 3,
+        max_analysis_attempts: int = 2,
+    ) -> None:
+        self.api_key = api_key.strip()
+        if not self.api_key:
+            raise ValueError("API Key 为空，请在环境变量 DASHSCOPE_API_KEY 或脚本参数中提供。")
+
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.knowledge_dir = knowledge_dir
+        self.model = model
+        self.http_attempts = max(1, http_attempts)
+        self.max_analysis_attempts = max(1, max_analysis_attempts)
+
+        self.base_url = "https://dashscope.aliyuncs.com/api/v1"
+        self.chat_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        self.default_timeout = 60
+        self.upload_timeout = 1800
+        self.chat_timeout = 3600
+
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.state_dir = self.output_dir / "workflow_v7_state"
+        self.raw_output_dir = self.state_dir / "raw_output"
+        self.parsed_dir = self.state_dir / "parsed_rows"
+        self.log_dir = self.state_dir / "logs"
+        self.summary_path = self.output_dir / f"场景行业产品分类汇总_{self.run_id}.csv"
+        self.latest_summary_path = self.output_dir / "场景行业产品分类汇总_latest.csv"
+
+        for directory in [self.output_dir, self.state_dir, self.raw_output_dir, self.parsed_dir, self.log_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
+
+        self.thread_local = threading.local()
+        self.logger = self._build_logger()
+        self.knowledge_map = self._load_knowledge_bases()
+        self.industry_kb_empty = not self.knowledge_map["industry"]
+        self.system_prompt = self._build_system_prompt()
+
+    def _build_logger(self) -> logging.Logger:
+        logger = logging.getLogger(f"OmniSceneIndustryWorkflow_{self.run_id}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if logger.handlers:
+            logger.handlers.clear()
+
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        file_handler = logging.FileHandler(self.log_dir / f"workflow_v7_{self.run_id}.log", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+        return logger
+
+    def _get_session(self) -> requests.Session:
+        session = getattr(self.thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            self.thread_local.session = session
+        return session
+
+    def _auth_headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        json_payload: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Any]] = None,
+        timeout: int = 60,
+        attempts: int = 3,
+        accepted_statuses: Optional[List[int]] = None,
+    ) -> requests.Response:
+        accepted = accepted_statuses or [200]
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._get_session().request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_payload,
+                    files=files,
+                    timeout=timeout,
+                )
+                if response.status_code in accepted:
+                    return response
+
+                error = RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+                last_error = error
+                if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts:
+                    self.logger.warning("请求失败，准备重试 %s %s，第 %s 次：%s", method, url, attempt, error)
+                    time.sleep(min(30, 2 ** attempt))
+                    continue
+                raise error
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < attempts:
+                    self.logger.warning("网络异常，准备重试 %s %s，第 %s 次：%s", method, url, attempt, exc)
+                    time.sleep(min(30, 2 ** attempt))
+                    continue
+                break
+
+        raise RuntimeError(f"{method} {url} 请求失败：{last_error}")
+
+    def _request_json(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        response = self._request(*args, **kwargs)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"接口返回非 JSON 数据：{exc}") from exc
+
+    def _read_text(self, path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError:
+            return path.read_text(encoding="utf-8-sig").strip()
+
+    def _load_knowledge_bases(self) -> Dict[str, str]:
+        scene_path = self.knowledge_dir / SCENE_KB_NAME
+        industry_path = self.knowledge_dir / INDUSTRY_KB_NAME
+        strategy_path = self.knowledge_dir / STRATEGY_KB_NAME
+
+        if not scene_path.exists():
+            raise ValueError(f"未找到知识库文件：{scene_path}")
+        scene_text = self._read_text(scene_path)
+        if not scene_text:
+            raise ValueError(f"知识库文件为空：{scene_path}")
+
+        if not industry_path.exists():
+            raise ValueError(f"未找到知识库文件：{industry_path}")
+        industry_text = self._read_text(industry_path)
+
+        if not strategy_path.exists():
+            raise ValueError(f"未找到知识库文件：{strategy_path}")
+        strategy_text = self._read_text(strategy_path)
+        if not strategy_text:
+            raise ValueError(f"知识库文件为空：{strategy_path}")
+
+        self.logger.info("已加载知识库：%s", scene_path.name)
+        if industry_text:
+            self.logger.info("已加载知识库：%s", industry_path.name)
+        else:
+            self.logger.warning("知识库文件为空：%s。行业及主营产品分类将按空知识库回退。", industry_path.name)
+        self.logger.info("已加载知识库：%s", strategy_path.name)
+
+        return {"scene": scene_text, "industry": industry_text, "strategy": strategy_text}
+
+    def _build_system_prompt(self) -> str:
+        sections = [
+            "# 角色定位",
+            "你是一位有丰富线下销售录音分析经验的高级质检专家。你必须直接听音频，结合可听见的语义内容与声学线索完成分类，不得只看字面词语做机械判断。",
+            "",
+            "# 核心任务",
+            "你只做三类任务：",
+            "1. 基于场景及客户行为分类体系知识库，判断每个沟通场次的主导场景类型和主导客户类型。",
+            "2. 基于客户行业及主营产品分类知识库，判断每个沟通场次的客户行业类型和主营产品类型。",
+            "3. 基于销售策略及销售话术知识库，只根据客户类型为每个沟通场次匹配一个最优销售策略。",
+            "4. 基于音频原话，提取销售在该场次中与该策略相匹配的具体话术片段，并做精炼总结。",
+            "",
+            "# 全局约束",
+            "1. 你只能使用下面三份知识库的定义，禁止调用其他知识库，禁止自创标签。",
+            "2. 必须基于整段音频的完整语义结构、客户反复表达的核心诉求、销售推进过程、环境线索和声学线索综合判断。",
+            "3. 声学线索包括但不限于语速变化、停顿、犹豫、打断、重叠说话、音量变化、环境噪声、多人参与、客户情绪波动。",
+            "4. 场次切分必须依据长停顿、对话重新开场、环境明显变化或独立沟通目标切换来完成。",
+            "5. 每个场次都必须只输出一个主导场景类型和一个主导客户类型，禁止并列输出多个标签。",
+            "6. 每个场次都必须只输出一个最终销售策略，禁止并列输出多个策略。",
+            "7. 销售策略匹配必须优先且主要依据客户类型，不要根据销售已经采取了什么行为来反推策略。",
+            "8. 具体话术总结必须优先引用销售原话或销售与客户的连续对话片段，禁止凭空概括不存在的话术。",
+            "9. 必须识别并避免把恶性话术当成优秀话术、推荐话术或策略依据。",
+            "10. 经凡出现以下任一情况，均认定为恶性话术或高风险话术：一，冒用平台身份，包括但不限于自称银行工作人员、银行外包人员、把下载动作说成银行 APP；二，强锁客户，包括但不限于全程不提分期利息、全程不告知借款到账属性、私自拿客户手机操作借款；三，承诺免息，包括但不限于一个月免息、优惠券抵扣息费、使用几个月可退贷、返还利息；四，录音不全，包括扫码至离场期间任意时间点存在缺失，或其他有意占用音频功能行为；五，短期提额或承诺可实现提额降息，包括但不限于承诺一个月、首期账单日、45天、2到3个月、3个月内、3个月左右、几个月内一定提额至某额度。凡提额降息相关营销话术涉及3个月内含3个月，均定义为短期提额话术。",
+            "11. 如果录音中出现恶性话术，不要把这类话术写成策略匹配的话术亮点，也不要把它作为销售策略合理性的证据。",
+            "12. 如果录音中没有明显体现该策略的话术，不要硬写，可以明确说明未体现明显匹配话术。",
+            "13. 若知识库为空、证据不足或音频无法稳定支持判断，必须明确回退到“未能根据知识库判断”，禁止臆造分类。",
+            "",
+            "## 场景及客户行为分类体系知识库",
+            self.knowledge_map["scene"],
+            "",
+            "## 客户行业及主营产品分类知识库",
+            self.knowledge_map["industry"] or "该知识库文件当前为空。禁止自行补全行业和主营产品分类体系；如无法依据该知识库判断，必须回退为“未能根据知识库判断”。",
+            "",
+            "## 销售策略及销售话术知识库",
+            self.knowledge_map["strategy"],
+        ]
+        return "\n".join(sections)
+
+    def _safe_stem(self, value: str) -> str:
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", value).strip("_")
+        return cleaned[:80] or "audio"
+
+    def _build_file_id(self, file_path: Path) -> str:
+        stat = file_path.stat()
+        raw = f"{file_path.resolve()}|{stat.st_size}|{int(stat.st_mtime)}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+    def discover_audio_files(self, patterns: List[str], max_files: int = 0) -> List[Path]:
+        files: Dict[str, Path] = {}
+        for pattern in patterns:
+            for path in sorted(self.input_dir.glob(pattern)):
+                if path.is_file():
+                    files[str(path.resolve()).lower()] = path
+
+        ordered = sorted(files.values(), key=lambda item: item.name.lower())
+        if max_files > 0:
+            ordered = ordered[:max_files]
+        return ordered
+
+    def detect_audio_format(self, audio_path: Path) -> str:
+        suffix = audio_path.suffix.lower().lstrip(".")
+        if suffix in {"wav", "mp3", "m4a", "aac", "amr", "flac"}:
+            return suffix
+        raise ValueError(f"不支持的音频格式：{audio_path.name}")
+
+    def upload_audio(self, file_path: Path, file_id: str, attempt: int) -> str:
+        policy_json = self._request_json(
+            "GET",
+            f"{self.base_url}/uploads",
+            headers=self._auth_headers(),
+            params={"action": "getPolicy", "model": self.model},
+            timeout=self.default_timeout,
+            attempts=self.http_attempts,
+        )
+        policy = policy_json.get("data")
+        if not policy:
+            raise RuntimeError(f"获取上传凭证失败：{policy_json}")
+
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        object_key = (
+            f"{policy['upload_dir'].rstrip('/')}/"
+            f"{self.run_id}_{file_id}_attempt{attempt}_{timestamp}_{file_path.name}"
+        )
+
+        with file_path.open("rb") as audio_file:
+            files = {
+                "key": (None, object_key),
+                "OSSAccessKeyId": (None, policy["oss_access_key_id"]),
+                "policy": (None, policy["policy"]),
+                "Signature": (None, policy["signature"]),
+                "x-oss-object-acl": (None, policy.get("x_oss_object_acl", "private")),
+                "x-oss-forbid-overwrite": (None, policy.get("x_oss_forbid_overwrite", "true")),
+                "success_action_status": (None, "200"),
+                "file": (file_path.name, audio_file),
+            }
+            self._request(
+                "POST",
+                policy["upload_host"],
+                files=files,
+                timeout=self.upload_timeout,
+                attempts=1,
+            )
+
+        return f"oss://{object_key}"
+
+    def _user_prompt(self, source_name: str, strict_mode: bool = False) -> str:
+        lines = [
+            "请直接听完整段销售录音，并先做场次切分，再逐场次输出分类结果。",
+            "只允许输出 JSON 数组，不要输出 Markdown，不要输出解释，不要输出代码块。",
+            "JSON 数组中的每个对象必须且只能包含以下 9 个键：录音ID、沟通ID、场景及客户类型、场景及客户类型依据、客户行业及产品类型、客户行业及产品类型依据、销售策略、销售策略依据、具体话术总结。",
+            f"录音ID固定写为：{source_name}",
+            "沟通ID必须统一命名为：场次1、场次2、场次3……，按音频中出现顺序编号。",
+            f"场景及客户类型必须写成：场景类型｜客户类型。场景类型只能从以下 4 类中选择 1 类：{'、'.join(SCENE_TYPES)}。客户类型只能从以下 6 类中选择 1 类：{'、'.join(CUSTOMER_TYPES)}。",
+            "场景及客户类型依据必须保持单行中文，说明为什么判定为该场景和该客户类型，优先引用客户表达、客户行为、推进节奏、多人干扰、环境噪声、语速、停顿、打断等证据，尽量给出至少 2 条证据。",
+        ]
+
+        if self.industry_kb_empty:
+            lines.extend(
+                [
+                    f"客户行业及主营产品分类知识库当前为空文件，因此客户行业及产品类型必须固定写成：{UNKNOWN_LABEL}｜{UNKNOWN_LABEL}。",
+                    "客户行业及产品类型依据必须明确写出：客户行业及主营产品分类知识库为空，当前无法按知识库分类。",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"客户行业及产品类型必须写成：行业类型｜主营产品类型。两部分都只能从客户行业及主营产品分类知识库中选择，禁止自创标签。",
+                    f"如果只能稳定判断其中一部分，另一部分写 {UNKNOWN_LABEL}；如果整体都无法稳定判断，则写 {UNKNOWN_LABEL}｜{UNKNOWN_LABEL}。",
+                    "客户行业及产品类型依据必须保持单行中文，说明依据来自客户的门店类型、行业词汇、产品名称、经营场景或业务描述；若证据不足必须明确写证据不足。",
+                ]
+            )
+
+        lines.extend(
+            [
+                f"销售策略必须只输出一个最终策略，且只能从以下 8 个中文策略名中选择 1 个：{'、'.join(STRATEGY_TYPES)}。",
+                "销售策略字段只写策略名字本身，不要带 STRATEGY_01、STRATEGY_02 这类前缀编号。",
+                "销售策略必须严格遵守销售策略知识库中的单策略输出原则，不能同时输出多个策略，也不能自创策略名。",
+                "销售策略匹配时，不要看销售当前实际采用了什么行为，不要因为销售已经在做对比、教育、推进就反推对应策略。",
+                "你要回答的是：面对这个客户类型，最应该匹配哪一种销售策略最优。",
+                "销售策略依据必须保持单行中文，明确说明该策略为什么最适合这个客户类型，重点依据客户类型本身及其典型特征来论证；可以补充沟通阶段和客户意向强弱，但不要把销售已发生的动作当作主依据。",
+                "具体话术总结必须围绕销售策略来写，只关注销售话术，不关注客户分类结论本身。",
+                "具体话术总结必须尽量保留原始对话表达，优先输出销售原话，必要时可带上客户上一句形成连续片段。",
+                "具体话术总结应总结：哪些销售原话片段体现了该策略，为什么这些片段与该策略匹配。",
+                "如果销售原话属于恶性话术或高风险话术，不要把它当成优秀话术或正向匹配话术来推荐。",
+                "如果销售原话同时具有策略相关性但又触犯恶性话术规则，应在具体话术总结中明确说明这是风险话术，不应作为优秀话术复用。",
+                "销售策略依据也不能用恶性话术来证明该策略正确，只能依据客户类型和合规的沟通目标来判断最优策略。",
+                "如果录音里销售并没有明显使用与该策略匹配的话术，不要硬编，直接写“未体现明显匹配话术”。",
+                "如果有多段有效话术，可放在同一个字段里，用1.2.3.分条，但仍保持单行输出。",
+            ]
+        )
+
+        lines.extend(
+            [
+                "每个字段都必须是单行字符串，不要换行，不要在字段内部使用英文逗号。",
+                "如果录音中只有一个独立沟通场次，就只输出一个对象；如果有多个独立沟通场次，就输出多个对象。",
+                "禁止输出多个场景并列，禁止输出多个客户类型并列。",
+                "禁止输出多个销售策略并列。",
+            ]
+        )
+
+        if strict_mode:
+            lines.extend(
+                [
+                    "上一轮输出不够稳定，这一轮请额外严格遵守：",
+                    "1. 输出必须是合法 JSON 数组",
+                    "2. 每个对象只能有 9 个键，键名必须完全一致",
+                    "3. 不要省略任何键，不要增加任何额外键",
+                    "4. 场景及客户类型字段必须严格使用一个全角竖线分隔两个标签",
+                    "5. 销售策略字段必须只包含一个策略名",
+                    "6. 具体话术总结字段必须存在",
+                    "7. 每个依据字段都必须非空，且保持单行中文",
+                ]
+            )
+
+        return "\n".join(lines)
+
+    def _extract_message_text(self, response: Dict[str, Any]) -> str:
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"模型响应异常：{response}") from exc
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts).strip()
+
+        raise RuntimeError(f"无法解析模型输出：{response}")
+
+    def analyze_audio(self, file_path: Path, file_id: str, strict_mode: bool = False, attempt: int = 1) -> str:
+        audio_url = self.upload_audio(file_path, file_id, attempt)
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 8000,
+            "modalities": ["text"],
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": audio_url,
+                                "format": self.detect_audio_format(file_path),
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": self._user_prompt(file_path.name, strict_mode=strict_mode),
+                        },
+                    ],
+                },
+            ],
+        }
+        response = self._request_json(
+            "POST",
+            self.chat_url,
+            headers={
+                **self._auth_headers(),
+                "Content-Type": "application/json",
+                "X-DashScope-OssResourceResolve": "enable",
+            },
+            json_payload=payload,
+            timeout=self.chat_timeout,
+            attempts=self.http_attempts,
+        )
+        return self._extract_message_text(response).strip()
+
+    def _strip_markdown(self, raw_text: str) -> str:
+        text = raw_text.replace("\ufeff", "").strip()
+        text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE)
+        return text.replace("```", "").strip()
+
+    def _clean_value(self, value: Any) -> str:
+        text = str(value or "")
+        text = text.replace("\r", " ").replace("\n", " ").strip()
+        return re.sub(r"\s+", " ", text)
+
+    def _extract_json_rows(self, raw_text: str) -> List[Dict[str, Any]]:
+        text = self._strip_markdown(raw_text)
+        candidates: List[str] = []
+        if text:
+            candidates.append(text)
+
+        left = text.find("[")
+        right = text.rfind("]")
+        if left != -1 and right != -1 and right > left:
+            candidates.append(text[left : right + 1])
+
+        left = text.find("{")
+        right = text.rfind("}")
+        if left != -1 and right != -1 and right > left:
+            candidates.append("[" + text[left : right + 1] + "]")
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(payload, dict):
+                return [payload]
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+
+        raise RuntimeError("模型输出未能解析为合法 JSON 数组。")
+
+    def parse_rows(self, raw_text: str, source_name: str) -> List[Dict[str, str]]:
+        items = self._extract_json_rows(raw_text)
+        if not items:
+            raise RuntimeError("模型未返回任何有效场次结果。")
+
+        rows: List[Dict[str, str]] = []
+        for index, item in enumerate(items, start=1):
+            row = {
+                "录音ID": source_name,
+                "沟通ID": self._clean_value(item.get("沟通ID") or f"场次{index}"),
+                "场景及客户类型": self._clean_value(item.get("场景及客户类型")),
+                "场景及客户类型依据": self._clean_value(item.get("场景及客户类型依据")),
+                "客户行业及产品类型": self._clean_value(item.get("客户行业及产品类型")),
+                "客户行业及产品类型依据": self._clean_value(item.get("客户行业及产品类型依据")),
+                "销售策略": self._clean_value(item.get("销售策略")),
+                "销售策略依据": self._clean_value(item.get("销售策略依据")),
+                "具体话术总结": self._clean_value(item.get("具体话术总结")),
+            }
+
+            if not row["沟通ID"]:
+                row["沟通ID"] = f"场次{index}"
+            if not row["场景及客户类型"]:
+                row["场景及客户类型"] = "待模型补充｜待模型补充"
+            if not row["场景及客户类型依据"]:
+                row["场景及客户类型依据"] = "模型未提供充分依据，建议结合音频人工复核。"
+
+            if self.industry_kb_empty:
+                row["客户行业及产品类型"] = f"{UNKNOWN_LABEL}｜{UNKNOWN_LABEL}"
+                row["客户行业及产品类型依据"] = "客户行业及主营产品分类知识库为空，当前流程未按知识库输出行业和主营产品分类。"
+            else:
+                if not row["客户行业及产品类型"]:
+                    row["客户行业及产品类型"] = f"{UNKNOWN_LABEL}｜{UNKNOWN_LABEL}"
+                if not row["客户行业及产品类型依据"]:
+                    row["客户行业及产品类型依据"] = "模型未提供充分依据，建议结合音频人工复核。"
+
+            if not row["销售策略"]:
+                row["销售策略"] = UNKNOWN_LABEL
+            if not row["销售策略依据"]:
+                row["销售策略依据"] = "模型未提供充分依据，建议结合音频人工复核。"
+            if not row["具体话术总结"]:
+                row["具体话术总结"] = "未体现明显匹配话术"
+
+            rows.append(row)
+
+        return rows
+
+    def _write_text(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def _write_json(self, path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _write_csv(self, path: Path, rows: List[Dict[str, str]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=SUMMARY_HEADERS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def process_file(self, file_path: Path) -> List[Dict[str, str]]:
+        file_id = self._build_file_id(file_path)
+        safe_stem = self._safe_stem(file_path.stem)
+        raw_path = self.raw_output_dir / f"{safe_stem}_{file_id}.txt"
+        parsed_json_path = self.parsed_dir / f"{safe_stem}_{file_id}.json"
+        parsed_csv_path = self.parsed_dir / f"{safe_stem}_{file_id}.csv"
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_analysis_attempts + 1):
+            try:
+                raw_output = self.analyze_audio(file_path, file_id, strict_mode=attempt > 1, attempt=attempt)
+                self._write_text(raw_path, raw_output)
+                rows = self.parse_rows(raw_output, file_path.name)
+                self._write_json(parsed_json_path, rows)
+                self._write_csv(parsed_csv_path, rows)
+                self.logger.info("处理成功：%s，输出场次数：%s", file_path.name, len(rows))
+                return rows
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning("处理失败：%s，第 %s 次：%s", file_path.name, attempt, exc)
+                if attempt < self.max_analysis_attempts:
+                    time.sleep(min(20, 2 ** attempt))
+
+        raise RuntimeError(f"{file_path.name} 处理失败：{last_error}")
+
+    def run(self, patterns: List[str], max_files: int = 0) -> List[Dict[str, str]]:
+        if not self.input_dir.exists():
+            raise ValueError(f"输入目录不存在：{self.input_dir}")
+
+        file_paths = self.discover_audio_files(patterns, max_files=max_files)
+        if not file_paths:
+            raise ValueError(f"未在 {self.input_dir} 找到匹配的录音文件。")
+
+        all_rows: List[Dict[str, str]] = []
+        for file_path in file_paths:
+            rows = self.process_file(file_path)
+            all_rows.extend(rows)
+
+        self._write_csv(self.summary_path, all_rows)
+        shutil.copyfile(self.summary_path, self.latest_summary_path)
+        self.logger.info("汇总输出已写入：%s", self.summary_path)
+        self.logger.info("最新汇总已同步到：%s", self.latest_summary_path)
+        return all_rows
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="基于 qwen3.5-omni-plus 的场景、客户类型、行业和产品分类工作流")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY, help="DashScope API Key")
+    parser.add_argument("--input-dir", default=str(DEFAULT_INPUT_DIR), help="录音文件目录")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="输出目录")
+    parser.add_argument("--knowledge-dir", default=str(DEFAULT_KNOWLEDGE_DIR), help="知识库目录")
+    parser.add_argument("--patterns", nargs="*", default=SUPPORTED_PATTERNS, help="录音文件匹配模式")
+    parser.add_argument("--max-files", type=int, default=0, help="限制本次最多处理多少个文件，0 表示不限制")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="模型名称")
+    parser.add_argument("--http-attempts", type=int, default=3, help="HTTP 请求最大重试次数")
+    parser.add_argument("--max-analysis-attempts", type=int, default=2, help="单文件最大分析重试次数")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    workflow = OmniSceneIndustryWorkflow(
+        api_key=args.api_key,
+        input_dir=Path(args.input_dir),
+        output_dir=Path(args.output_dir),
+        knowledge_dir=Path(args.knowledge_dir),
+        model=args.model,
+        http_attempts=args.http_attempts,
+        max_analysis_attempts=args.max_analysis_attempts,
+    )
+    workflow.run(args.patterns, max_files=args.max_files)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
